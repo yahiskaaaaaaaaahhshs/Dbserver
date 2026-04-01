@@ -235,7 +235,7 @@ def adyen_process(key, card_data):
         db[normalized_card] = response
         save_db(ADYEN_RESPONSE_DB_FILE, db)
     
-    time.sleep(16)
+    time.sleep(3)
     log_transaction(ADYEN_LOG_FILE, normalized_card, response)
     return jsonify({
         "card": normalized_card,
