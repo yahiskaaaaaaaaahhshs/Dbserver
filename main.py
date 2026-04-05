@@ -5,11 +5,10 @@ import os
 import json
 from datetime import datetime
 import re
-import threading
-from werkzeug.serving import make_server
+
+app = Flask(__name__)
 
 API_KEY = "yashikaaa"
-CARD_FORMAT = r'^\d{13,16}\|\d{2}\|\d{2,4}\|\d{3,4}$'
 
 def normalize_card(card_data):
     try:
@@ -47,358 +46,235 @@ def save_db(filename, data):
     except:
         pass
 
-def log_transaction(log_file, card_data, response):
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_file, 'a') as f:
-            f.write(f"{timestamp}|{card_data}|{json.dumps(response)}\n")
-    except:
-        pass
+# ============ CHAOS AUTH (2 sec, 30% approve) ============
+CHAOS_DECLINE = [
+    {"response": "Issuer declined card addition", "status": "declined"},
+    {"response": "Invalid card number", "status": "declined"},
+    {"response": "Card expired", "status": "declined"},
+    {"response": "Invalid security code", "status": "declined"},
+    {"response": "Card not supported", "status": "declined"}
+]
 
-# ==============================================
-# Chaos Auth - Port 5000 (2 sec delay, 30% approve)
-# ==============================================
-def create_chaos_auth():
-    app = Flask("Chaos_Auth")
-    RESPONSE_DB_FILE = "chaos_responses.json"
-    LOG_FILE = "chaos_transactions.log"
-    
-    DECLINE_RESPONSES = [
-        {"response": "Issuer declined card addition", "status": "declined"},
-        {"response": "Invalid card number", "status": "declined"},
-        {"response": "Card expired", "status": "declined"},
-        {"response": "Invalid security code", "status": "declined"},
-        {"response": "Card not supported", "status": "declined"},
-        {"response": "Card already exists", "status": "declined"},
-        {"response": "Billing address mismatch", "status": "declined"},
-        {"response": "Card restricted by issuer", "status": "declined"},
-        {"response": "Unable to verify card", "status": "declined"},
-        {"response": "Issuer unavailable", "status": "declined"}
-    ]
-    
-    APPROVE_RESPONSES = [
-        {"response": "Card added successfully", "status": "approved"},
-        {"response": "Payment method saved", "status": "approved"},
-        {"response": "Card verified and added", "status": "approved"},
-        {"response": "Card successfully linked", "status": "approved"}
-    ]
+CHAOS_APPROVE = [
+    {"response": "Card added successfully", "status": "approved"},
+    {"response": "Payment method saved", "status": "approved"}
+]
 
-    @app.route('/key=<key>/cc=<card_data>')
-    def process(key, card_data):
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        
-        normalized_card = normalize_card(card_data)
-        if not normalized_card:
-            return jsonify({"error": "Invalid card format. Use CC|MM|YY|CVV or CC|MM|YYYY|CVV"}), 400
-        
-        db = load_db(RESPONSE_DB_FILE)
-        
-        if normalized_card in db:
-            response = db[normalized_card]
+@app.route('/chaos/key=<key>/cc=<card_data>')
+def chaos_auth(key, card_data):
+    if key != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    normalized_card = normalize_card(card_data)
+    if not normalized_card:
+        return jsonify({"error": "Invalid card format"}), 400
+    
+    db = load_db("chaos_responses.json")
+    
+    if normalized_card in db:
+        response = db[normalized_card]
+    else:
+        if random.random() <= 0.3:
+            response = random.choice(CHAOS_APPROVE)
         else:
-            if random.random() <= 0.3:
-                response = random.choice(APPROVE_RESPONSES)
-            else:
-                response = random.choice(DECLINE_RESPONSES)
-            
-            db[normalized_card] = response
-            save_db(RESPONSE_DB_FILE, db)
-        
-        time.sleep(2)
-        log_transaction(LOG_FILE, normalized_card, response)
-        
-        return jsonify({
-            "card": normalized_card,
-            "response": response["response"],
-            "status": response["status"],
-            "gateway": "Chaos Auth"
-        })
+            response = random.choice(CHAOS_DECLINE)
+        db[normalized_card] = response
+        save_db("chaos_responses.json", db)
     
-    return app
+    time.sleep(2)
+    return jsonify({
+        "card": normalized_card,
+        "response": response["response"],
+        "status": response["status"],
+        "gateway": "Chaos Auth"
+    })
 
-# ==============================================
-# Adyen Auth - Port 3600 (3 sec delay, 20% approve)
-# ==============================================
-def create_adyen_auth():
-    app = Flask("Adyen_Auth")
-    RESPONSE_DB_FILE = "adyen_responses.json"
-    LOG_FILE = "adyen_transactions.log"
-    
-    DECLINE_RESPONSES = [
-        {"response": "Refused by issuer", "status": "declined"},
-        {"response": "Invalid card details", "status": "declined"},
-        {"response": "Expired card", "status": "declined"},
-        {"response": "Card not supported", "status": "declined"},
-        {"response": "Restricted card", "status": "declined"},
-        {"response": "Invalid CVV", "status": "declined"},
-        {"response": "Card already added", "status": "declined"},
-        {"response": "Issuer timeout", "status": "declined"},
-        {"response": "3D Secure failed", "status": "declined"},
-        {"response": "Account verification needed", "status": "declined"}
-    ]
-    
-    APPROVE_RESPONSES = [
-        {"response": "Card added to wallet", "status": "approved"},
-        {"response": "Payment method saved", "status": "approved"},
-        {"response": "Card verified and stored", "status": "approved"},
-        {"response": "Card successfully linked", "status": "approved"}
-    ]
+# ============ ADYEN AUTH (3 sec, 20% approve) ============
+ADYEN_DECLINE = [
+    {"response": "Refused by issuer", "status": "declined"},
+    {"response": "Invalid card details", "status": "declined"},
+    {"response": "Expired card", "status": "declined"},
+    {"response": "Card not supported", "status": "declined"},
+    {"response": "Invalid CVV", "status": "declined"}
+]
 
-    @app.route('/key=<key>/cc=<card_data>')
-    def process(key, card_data):
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        
-        normalized_card = normalize_card(card_data)
-        if not normalized_card:
-            return jsonify({"error": "Invalid card format. Use CC|MM|YY|CVV or CC|MM|YYYY|CVV"}), 400
-        
-        db = load_db(RESPONSE_DB_FILE)
-        
-        if normalized_card in db:
-            response = db[normalized_card]
+ADYEN_APPROVE = [
+    {"response": "Card added to wallet", "status": "approved"},
+    {"response": "Payment method saved", "status": "approved"}
+]
+
+@app.route('/adyen/key=<key>/cc=<card_data>')
+def adyen_auth(key, card_data):
+    if key != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    normalized_card = normalize_card(card_data)
+    if not normalized_card:
+        return jsonify({"error": "Invalid card format"}), 400
+    
+    db = load_db("adyen_responses.json")
+    
+    if normalized_card in db:
+        response = db[normalized_card]
+    else:
+        if random.random() <= 0.2:
+            response = random.choice(ADYEN_APPROVE)
         else:
-            if random.random() <= 0.2:
-                response = random.choice(APPROVE_RESPONSES)
-            else:
-                response = random.choice(DECLINE_RESPONSES)
-            
-            db[normalized_card] = response
-            save_db(RESPONSE_DB_FILE, db)
-        
-        time.sleep(3)
-        log_transaction(LOG_FILE, normalized_card, response)
-        
-        return jsonify({
-            "card": normalized_card,
-            "response": response["response"],
-            "status": response["status"],
-            "gateway": "Adyen Auth"
-        })
+            response = random.choice(ADYEN_DECLINE)
+        db[normalized_card] = response
+        save_db("adyen_responses.json", db)
     
-    return app
+    time.sleep(3)
+    return jsonify({
+        "card": normalized_card,
+        "response": response["response"],
+        "status": response["status"],
+        "gateway": "Adyen Auth"
+    })
 
-# ==============================================
-# App Based Auth - Port 7000 (3 sec delay, 20% approve)
-# ==============================================
-def create_app_auth():
-    app = Flask("App_Auth")
-    RESPONSE_DB_FILE = "app_responses.json"
-    LOG_FILE = "app_transactions.log"
-    
-    DECLINE_RESPONSES = [
-        {"response": "Unable to verify card", "status": "declined"},
-        {"response": "Digital wallet enrollment failed", "status": "declined"},
-        {"response": "Issuer not supporting digital cards", "status": "declined"},
-        {"response": "Device not recognized", "status": "declined"},
-        {"response": "Biometric verification failed", "status": "declined"},
-        {"response": "Tokenization failed", "status": "declined"},
-        {"response": "Card already in wallet", "status": "declined"},
-        {"response": "Secure element error", "status": "declined"},
-        {"response": "Invalid card details", "status": "declined"},
-        {"response": "Card expired", "status": "declined"}
-    ]
-    
-    APPROVE_RESPONSES = [
-        {"response": "Card added to digital wallet", "status": "approved"},
-        {"response": "Payment method saved in app", "status": "approved"},
-        {"response": "Card tokenization successful", "status": "approved"},
-        {"response": "Digital card issued", "status": "approved"}
-    ]
+# ============ APP BASED AUTH (3 sec, 20% approve) ============
+APP_DECLINE = [
+    {"response": "Unable to verify card", "status": "declined"},
+    {"response": "Digital wallet enrollment failed", "status": "declined"},
+    {"response": "Device not recognized", "status": "declined"},
+    {"response": "Biometric verification failed", "status": "declined"},
+    {"response": "Tokenization failed", "status": "declined"}
+]
 
-    @app.route('/key=<key>/cc=<card_data>')
-    def process(key, card_data):
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        
-        normalized_card = normalize_card(card_data)
-        if not normalized_card:
-            return jsonify({"error": "Invalid card format. Use CC|MM|YY|CVV or CC|MM|YYYY|CVV"}), 400
-        
-        db = load_db(RESPONSE_DB_FILE)
-        
-        if normalized_card in db:
-            response = db[normalized_card]
+APP_APPROVE = [
+    {"response": "Card added to digital wallet", "status": "approved"},
+    {"response": "Card tokenization successful", "status": "approved"}
+]
+
+@app.route('/app/key=<key>/cc=<card_data>')
+def app_auth(key, card_data):
+    if key != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    normalized_card = normalize_card(card_data)
+    if not normalized_card:
+        return jsonify({"error": "Invalid card format"}), 400
+    
+    db = load_db("app_responses.json")
+    
+    if normalized_card in db:
+        response = db[normalized_card]
+    else:
+        if random.random() <= 0.2:
+            response = random.choice(APP_APPROVE)
         else:
-            if random.random() <= 0.2:
-                response = random.choice(APPROVE_RESPONSES)
-            else:
-                response = random.choice(DECLINE_RESPONSES)
-            
-            db[normalized_card] = response
-            save_db(RESPONSE_DB_FILE, db)
-        
-        time.sleep(3)
-        log_transaction(LOG_FILE, normalized_card, response)
-        
-        return jsonify({
-            "card": normalized_card,
-            "response": response["response"],
-            "status": response["status"],
-            "gateway": "App Based Auth"
-        })
+            response = random.choice(APP_DECLINE)
+        db[normalized_card] = response
+        save_db("app_responses.json", db)
     
-    return app
+    time.sleep(3)
+    return jsonify({
+        "card": normalized_card,
+        "response": response["response"],
+        "status": response["status"],
+        "gateway": "App Based Auth"
+    })
 
-# ==============================================
-# Auth Net - Port 6000 (0.1-0.5 sec, 75% approve)
-# ==============================================
-def create_authnet():
-    app = Flask("Auth_Net")
-    RESPONSE_DB_FILE = "authnet_responses.json"
-    LOG_FILE = "authnet_transactions.log"
-    
-    DECLINE_RESPONSES = [
-        {"response": "The payment gateway has declined the request.", "status": "declined"},
-        {"response": "The request was declined.", "status": "declined"},
-        {"response": "The billing address does not match the card on file.", "status": "declined"},
-        {"response": "The Card Code (CVV) is invalid.", "status": "declined"},
-        {"response": "The credit card has been declined by the issuing bank.", "status": "declined"}
-    ]
-    
-    APPROVE_RESPONSES = [
-        {"response": "Card added successfully", "status": "approved"},
-        {"response": "Payment method saved", "status": "approved"},
-        {"response": "Card verified and added", "status": "approved"},
-        {"response": "Card successfully linked to account", "status": "approved"}
-    ]
+# ============ AUTH NET (0.1-0.5 sec, 75% approve) ============
+AUTHNET_DECLINE = [
+    {"response": "The payment gateway has declined the request.", "status": "declined"},
+    {"response": "The request was declined.", "status": "declined"},
+    {"response": "The billing address does not match the card on file.", "status": "declined"},
+    {"response": "The Card Code (CVV) is invalid.", "status": "declined"},
+    {"response": "The credit card has been declined by the issuing bank.", "status": "declined"}
+]
 
-    @app.route('/key=<key>/cc=<card_data>')
-    def process(key, card_data):
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        
-        normalized_card = normalize_card(card_data)
-        if not normalized_card:
-            return jsonify({"error": "Invalid card format. Use CC|MM|YY|CVV or CC|MM|YYYY|CVV"}), 400
-        
-        db = load_db(RESPONSE_DB_FILE)
-        
-        if normalized_card in db:
-            response = db[normalized_card]
+AUTHNET_APPROVE = [
+    {"response": "Card added successfully", "status": "approved"},
+    {"response": "Card verified and added", "status": "approved"}
+]
+
+@app.route('/authnet/key=<key>/cc=<card_data>')
+def authnet(key, card_data):
+    if key != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    normalized_card = normalize_card(card_data)
+    if not normalized_card:
+        return jsonify({"error": "Invalid card format"}), 400
+    
+    db = load_db("authnet_responses.json")
+    
+    if normalized_card in db:
+        response = db[normalized_card]
+    else:
+        if random.random() <= 0.75:
+            response = random.choice(AUTHNET_APPROVE)
         else:
-            if random.random() <= 0.75:
-                response = random.choice(APPROVE_RESPONSES)
-            else:
-                response = random.choice(DECLINE_RESPONSES)
-            
-            db[normalized_card] = response
-            save_db(RESPONSE_DB_FILE, db)
-        
-        time.sleep(random.uniform(0.1, 0.5))
-        log_transaction(LOG_FILE, normalized_card, response)
-        
-        return jsonify({
-            "card": normalized_card,
-            "response": response["response"],
-            "status": response["status"],
-            "gateway": "Auth Net"
-        })
+            response = random.choice(AUTHNET_DECLINE)
+        db[normalized_card] = response
+        save_db("authnet_responses.json", db)
     
-    return app
+    time.sleep(random.uniform(0.1, 0.5))
+    return jsonify({
+        "card": normalized_card,
+        "response": response["response"],
+        "status": response["status"],
+        "gateway": "Auth Net"
+    })
 
-# ==============================================
-# PayPal - Port 8000 (4 sec delay, 20% approve)
-# ==============================================
-def create_paypal():
-    app = Flask("PayPal")
-    RESPONSE_DB_FILE = "paypal_responses.json"
-    LOG_FILE = "paypal_transactions.log"
-    
-    DECLINE_RESPONSES = [
-        {"response": "Unable to add card to PayPal", "status": "declined"},
-        {"response": "Card verification failed", "status": "declined"},
-        {"response": "Issuer declined card addition", "status": "declined"},
-        {"response": "Card already linked to another account", "status": "declined"},
-        {"response": "Invalid security code", "status": "declined"},
-        {"response": "Card expired", "status": "declined"},
-        {"response": "Card type not accepted", "status": "declined"},
-        {"response": "Billing address mismatch", "status": "declined"},
-        {"response": "PayPal account restricted", "status": "declined"},
-        {"response": "Tokenization failed", "status": "declined"}
-    ]
-    
-    APPROVE_RESPONSES = [
-        {"response": "Card added to PayPal successfully", "status": "approved"},
-        {"response": "Payment method saved in PayPal", "status": "approved"},
-        {"response": "Card verified and linked to PayPal", "status": "approved"},
-        {"response": "New card added to your PayPal wallet", "status": "approved"}
-    ]
+# ============ PAYPAL (4 sec, 20% approve) ============
+PAYPAL_DECLINE = [
+    {"response": "Unable to add card to PayPal", "status": "declined"},
+    {"response": "Card verification failed", "status": "declined"},
+    {"response": "Issuer declined card addition", "status": "declined"},
+    {"response": "Card already linked to another account", "status": "declined"},
+    {"response": "Invalid security code", "status": "declined"}
+]
 
-    @app.route('/key=<key>/cc=<card_data>')
-    def process(key, card_data):
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        
-        normalized_card = normalize_card(card_data)
-        if not normalized_card:
-            return jsonify({"error": "Invalid card format. Use CC|MM|YY|CVV or CC|MM|YYYY|CVV"}), 400
-        
-        db = load_db(RESPONSE_DB_FILE)
-        
-        if normalized_card in db:
-            response = db[normalized_card]
+PAYPAL_APPROVE = [
+    {"response": "Card added to PayPal successfully", "status": "approved"},
+    {"response": "Card verified and linked to PayPal", "status": "approved"}
+]
+
+@app.route('/paypal/key=<key>/cc=<card_data>')
+def paypal(key, card_data):
+    if key != API_KEY:
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    normalized_card = normalize_card(card_data)
+    if not normalized_card:
+        return jsonify({"error": "Invalid card format"}), 400
+    
+    db = load_db("paypal_responses.json")
+    
+    if normalized_card in db:
+        response = db[normalized_card]
+    else:
+        if random.random() <= 0.2:
+            response = random.choice(PAYPAL_APPROVE)
         else:
-            if random.random() <= 0.2:
-                response = random.choice(APPROVE_RESPONSES)
-            else:
-                response = random.choice(DECLINE_RESPONSES)
-            
-            db[normalized_card] = response
-            save_db(RESPONSE_DB_FILE, db)
-        
-        time.sleep(4)
-        log_transaction(LOG_FILE, normalized_card, response)
-        
-        return jsonify({
-            "card": normalized_card,
-            "response": response["response"],
-            "status": response["status"],
-            "gateway": "PayPal"
-        })
+            response = random.choice(PAYPAL_DECLINE)
+        db[normalized_card] = response
+        save_db("paypal_responses.json", db)
     
-    return app
+    time.sleep(4)
+    return jsonify({
+        "card": normalized_card,
+        "response": response["response"],
+        "status": response["status"],
+        "gateway": "PayPal"
+    })
 
-# ==============================================
-# Start all servers
-# ==============================================
-def run_servers():
-    servers = [
-        make_server('0.0.0.0', 5000, create_chaos_auth()),
-        make_server('0.0.0.0', 3600, create_adyen_auth()),
-        make_server('0.0.0.0', 7000, create_app_auth()),
-        make_server('0.0.0.0', 6000, create_authnet()),
-        make_server('0.0.0.0', 8000, create_paypal())
-    ]
-    
-    threads = []
-    for server in servers:
-        t = threading.Thread(target=server.serve_forever)
-        threads.append(t)
-        t.start()
-    
-    print("=" * 50)
-    print("All payment gateway APIs are running (CARD ADD MODE)")
-    print("=" * 50)
-    print("Chaos Auth    | Port 5000 | 2 sec delay | 30% approve")
-    print("Adyen Auth    | Port 3600 | 3 sec delay | 20% approve")
-    print("App Based Auth| Port 7000 | 3 sec delay | 20% approve")
-    print("Auth Net      | Port 6000 | 0.1-0.5 sec | 75% approve")
-    print("PayPal        | Port 8000 | 4 sec delay | 20% approve")
-    print("=" * 50)
-    print("\nExample URL:")
-    print("http://localhost:5000/key=yashikaaa/cc=4111111111111111|12|25|123")
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nShutting down servers...")
-        for server in servers:
-            server.shutdown()
-        for t in threads:
-            t.join()
+# ============ ROOT ENDPOINT ============
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Payment Gateway APIs are running!",
+        "gateways": {
+            "chaos": "/chaos/key=yashikaaa/cc=CC|MM|YY|CVV",
+            "adyen": "/adyen/key=yashikaaa/cc=CC|MM|YY|CVV",
+            "app": "/app/key=yashikaaa/cc=CC|MM|YY|CVV",
+            "authnet": "/authnet/key=yashikaaa/cc=CC|MM|YY|CVV",
+            "paypal": "/paypal/key=yashikaaa/cc=CC|MM|YY|CVV"
+        }
+    })
 
 if __name__ == '__main__':
-    run_servers()
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
